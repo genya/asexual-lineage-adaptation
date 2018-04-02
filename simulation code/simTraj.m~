@@ -1,0 +1,191 @@
+function [traj] = simTraj(s,inoc,measTimes,genMuts,delS,inocTime)
+%function [traj] = simTraj(s,inoc,measTimes,genMuts,delS,inocTime)
+%
+% s = fitness of seeded lineage
+% inoc = initial frequency of seeded lineage
+% measTimes = time points of output trajectory
+% genMuts = function handle to DFE (output of returnGenMutFunct.m)
+% delS = fitness class increment, another output of returnGenMutFunct.m, default = 10^-4
+% inocTime = time of seeding (generations)
+%
+% For speed, make the following approximations:
+% 
+% 1) within a xfer cycle, there is not more than one mutant arising per
+% lineage, i.e. for any mutation, the progeny bearing that mutation cannot
+% get another mutation until the next transfer-dilution cycle
+%
+% 2) for the purposes of determining the number of mutations arising in a
+% cycle, the number of cell divisions of each fitness class is calculated
+% approximately
+%
+% 3) all mutations that survive their first bottleneck are unique, i.e.
+% every new mutation leaves 0 or 1 survivors after its first bottleneck,
+% but the average total number of mutants is unaffected by the approx.
+%
+% 4) for fitness classes expected to contain >10 individuals after dilution,
+% their number post-dilution is drawn from a gaussian rather than poisson
+% distribution. 
+
+%hard-coded params
+Nb = 10^4;
+gPX = 10;
+smallThresh = 10; 
+    %dilution of fitness classes with more cells than this use gaussian
+    %approx to poisson distribution
+
+%initialize output
+traj = zeros(length(measTimes),1)-1;
+    %traj(i) = -1 => traj(i) not yet recorded
+    
+%Simulate initial clonal expansion from Nold to Nmax
+Nold = 1;
+Nmax = 3*10^8;
+
+%initialize population
+sizes = sparse(1,... %each row is a fitness class, fitness = (row index - 1) * delS
+        1,... %each column is a lineage
+        Nold); %starting pop sizes
+t= 0; 
+while Nold <= Nmax
+
+    %calulate growth (deterministic)
+    [fitInds, ~, cnts] = find(sizes);
+    Nold = sum(cnts);
+
+    tStep = min(1,max(log2(Nmax/Nold),0));  %number of doublings in this time step
+
+    Nnew = (2^tStep)*cnts;%everyone has same fitness
+
+    %draw mutants    
+    [muts fitSteps] = genMuts(Nnew);
+    totMuts = sum(muts);    
+
+    if totMuts > 0
+
+        %distribute mutations
+            %for each fitStep, need to add the index of its source fitness
+            %class and assign it to its source lineage   
+        [mutInds, ~, muts] = find(muts);
+
+        x = 1;
+        for i=1:length(mutInds)
+            pick = x:x+muts(i)-1;
+            fitSteps(pick) = fitSteps(pick) + fitInds(mutInds(i)); 
+            x = x + muts(i);
+        end    
+
+        %combine old guys, not-mutated offspring, and mutants 
+        sizes = sparse(...
+            [fitInds; fitSteps],...
+            ones(totMuts+length(fitInds),1),...
+            [Nnew; ones(totMuts,1)]); 
+    else
+        %update pop
+        sizes = sparse(fitInds,ones(length(fitInds),1),Nnew); 
+    end
+
+    %increment time
+    t = t + tStep;   
+
+end
+
+%First population bottleneck
+[fitInds, linInds, cnts] = find(sizes);
+cnts = poissrnd(cnts*Nb/sum(cnts));
+
+sizes = sparse(fitInds,...
+            linInds,...
+            cnts); 
+       
+%Run simulation, adding introduced lineage at generation inocTime.
+t=0; nextTimePt = 1; linAdded = false;
+while t<= measTimes(end)
+    
+    if linAdded == true %check for fixation
+        linSizes = sum(sizes);
+        if find(linSizes==0,1)
+            %if fixation, fill the rest of trajectory with current value
+            traj(traj==-1) = linSizes(2)/sum(linSizes);
+            return        
+        end
+        
+        %record trajectory
+        if t >= measTimes(nextTimePt) %linSizes calculated above 
+            traj(nextTimePt) = linSizes(2)/sum(linSizes); %pop fraction = seeded lineage        
+            measTimes(nextTimePt) = -1; %mark current time pt as measured
+            nextTimePt = find(measTimes>0,1); %get next time pt
+           
+        end             
+        
+    elseif round(t) >= inocTime
+        
+        %introduce lineage
+        [fitInds, linInds, cnts] = find(sizes);
+        cnts = poissrnd(cnts*Nb*(1-inoc)/sum(cnts));
+        sizes = sparse([fitInds; round(s/delS)+1],...
+            [linInds; 2],...
+            [cnts; round(Nb*inoc)]);
+        linAdded = true;              
+        
+        %reset time
+        t = 0;
+        
+        %record trajectory
+        if measTimes(nextTimePt)==0
+            traj(1:nextTimePt) = inoc; %pop fraction = seeded lineage        
+            measTimes(1:nextTimePt) = -1; %mark current time pt as measured
+            nextTimePt = find(measTimes>0,1); %get next time pt
+        end             
+    end     
+
+    %deterministic growth & dilution
+    [fitInds, linInds, cnts] = find(sizes);    
+   
+    Nnew = Nb*(cnts.*exp(gPX*(fitInds-1)*delS))...
+          /sum(cnts.*exp(gPX*(fitInds-1)*delS));
+        %     Z = cnts.*exp(gPX*(fitInds-1)*delS); 
+        %     Nnew = Nb*Z/sum(Z); %expected fitness class sizes after dilution
+    
+    %Population bottleneck (uses Poisson random numbers for small fitness
+    %classes and gaussian random numbers for larger fitness classes)
+    pickSmall = Nnew < smallThresh;
+    Nnew( pickSmall) = poissrnd(Nnew(pickSmall));
+    Nnew( ~pickSmall) = randn(size(Nnew(~pickSmall))).*sqrt(Nnew(~pickSmall)) + Nnew(~pickSmall);
+    Nnew(Nnew < 0) = 0;
+
+    %draw mutants    
+    [muts fitSteps] = genMuts(Nnew*gPX);
+    totMuts = sum(muts);
+    
+    %draw mutational effects
+    if  totMuts > 0
+
+        Nnew = Nnew-muts; Nnew(Nnew < 0) = 0;
+
+        %distribute mutations
+            %for each fitStep, add the index of its source fitness class
+            %and assign it to its source lineage   
+        mutLin = zeros(totMuts,1);
+        [mutInds, ~, muts] = find(muts);
+
+        x = 1;
+        for i=1:length(mutInds)
+            pick = x:x+muts(i)-1;
+            fitSteps(pick) = fitSteps(pick) + fitInds(mutInds(i)); 
+            mutLin(pick) = linInds(mutInds(i));
+            x = x + muts(i);
+        end    
+        
+        %update pop with mutants 
+        sizes = sparse(...
+            [fitInds; fitSteps],...
+            [linInds; mutLin],...
+            [Nnew; ones(totMuts,1)]); 
+    else
+        %update pop
+        sizes = sparse(fitInds,linInds,Nnew); 
+    end
+    
+    %increment time
+     t = t + gPX;           
+end
